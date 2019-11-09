@@ -2,11 +2,15 @@ import functools
 import os.path
 import pickle
 import sys
+from time import sleep
 from typing import List, Dict
 
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+
+DEBUG = 1
+SHARE_WAIT_SECS = 10
 
 # If modifying these scopes, delete the file token.pickle.
 SCOPES = [
@@ -44,6 +48,15 @@ def comparator(a, b):
 
 def output_format(i, item):
     return f"[{i}] {item['name']}: {item['mimeType']} - [{item['id']}]"
+
+
+def wait(secs):
+    i = 0
+    while i < secs:
+        sleep(1)
+        print(".", end="")
+        i += 1
+    print()
 
 
 class DriveHelper:
@@ -101,7 +114,8 @@ class DriveHelper:
 
         recursive_fn(KINSPIRE_OFFICIAL)
 
-        print(*[f"-> {path_piece['name']}" for path_piece in path], sep="\n")
+        print()
+        print(*[f"-> {path_piece['name']}" for path_piece in path])
 
         return path
 
@@ -115,11 +129,11 @@ class DriveHelper:
         curr_folder: Dict[str, str] = KINSPIRE_OFFICIAL
         to_unshare: List[Dict] = []
 
-        def callback(request_id, response, exception):
+        def callback(file_id, response, exception):
             if exception:
                 print(exception, file=sys.stderr)
             else:
-                files = filter(lambda file: file['id'] != request_id, response.get('files', []))
+                files = (file for file in response.get('files', []) if file['id'] != file_id)
 
                 # Add to our collection of files we want to eventually unshare
                 to_unshare.extend(files)
@@ -140,38 +154,54 @@ class DriveHelper:
 
         return to_unshare
 
-    def share_path(self, path, user: str, to_unshare):
+    def share(self, user: str):
         # Share Kinspire Official if not already shared.
         print("Sharing Kinspire Official...", end="")
         self.service.permissions().create(fileId=KINSPIRE_OFFICIAL['id'],
                                           body={'role': 'writer', 'type': 'user', 'emailAddress': user}).execute()
         print("done.")
 
-        # Unshare everything in to_unshare
-        permissions_batch = []
+        wait(SHARE_WAIT_SECS)
 
-        def callback(request_id, response, exception):
+    def unshare(self, user: str, to_unshare: List[Dict]):
+        # Unshare everything in to_unshare
+        permissions_to_remove = []
+
+        # Get permission ID's for all items in to_unshare
+        def callback(file_id, response, exception):
             # request_id: file requested
             if exception:
                 print(exception, file=sys.stderr)
+                sys.exit(1)
             else:
                 # Find the permission we care about
                 perms = response['permissions']
-                perm_id = [perm['id'] for perm in perms if ('emailAddress' in perm and perm['emailAddress'] == user)]
-                if len(perm_id) > 0:
-                    print("Found!")
-                # permissions_batch.append({'id': request_id, 'permissionId': perm_id})
+                try:
+                    perm_id = next(
+                        perm['id'] for perm in perms if ('emailAddress' in perm and perm['emailAddress'] == user))
+                    permissions_to_remove.append({'id': file_id, 'permissionId': perm_id})
+                except StopIteration:
+                    print(f"\nCould not find permissions for {user} for {file_id} - "
+                          f"{next(file['name'] for file in to_unshare if file['id'] == file_id)}. Ignoring")
 
         batch = self.service.new_batch_http_request(callback=callback)
-
-        # Get permission ID's for all items in to_unshare
         for item in to_unshare:
             batch.add(self.service.files().get(fileId=item['id'], fields="permissions"), request_id=item['id'])
-            break
-
         batch.execute()
+        print("Finished gathering permissions to remove.")
+
+        # Perform the unshare
+        print("Deleting permissions...", end="")
+        perms_batch = self.service.new_batch_http_request()
+        for item in permissions_to_remove:
+            perms_batch.add(self.service.permissions().delete(fileId=item['id'], permissionId=item['permissionId']))
+        perms_batch.execute()
+        print("done.")
 
     def run(self):
+        if DEBUG:
+            self.clean()
+
         # Figure out which exact folder that needs to be shared and evaluate the path to the Official for this folder
         path = self.get_path()
 
@@ -180,9 +210,22 @@ class DriveHelper:
 
         to_unshare = self.get_files_to_unshare(path, user)
 
-        # Add the user to Kinspire Official, remove from all other folders. Enter the folder,
-        #     remove all others. Recurse until we reach the current folder.
-        self.share_path(path, user, to_unshare)
+        # Add the user to Kinspire Official
+        self.share(user)
+
+        # Unshare
+        self.unshare(user, to_unshare)
+
+    def clean(self):
+        user = 'sarangj@msn.com'
+        perms = self.service.files().get(fileId=KINSPIRE_OFFICIAL['id'], fields="permissions").execute().get(
+            'permissions')
+        try:
+            perm_id = next(perm['id'] for perm in perms if ('emailAddress' in perm and perm['emailAddress'] == user))
+            self.service.permissions().delete(fileId=KINSPIRE_OFFICIAL['id'], permissionId=perm_id).execute()
+            print("Kinspire Official unshared.")
+        except StopIteration:
+            print("Not shared.")
 
 
 if __name__ == '__main__':
